@@ -96,18 +96,6 @@ parallel. Both can be faster on some hardware but add complexity and fragility.
 
 You must download FFmpeg yourself from the links above in order to use ClipForge.
 
-## Making a double-click `.exe` (optional)
-
-There's nothing to compile; Python runs the `.py` directly. If you want a single `.exe` for friends:
-
-```
-pip install pyinstaller
-pyinstaller --onefile --noconsole clipforge.py
-```
-
-The result is in `dist\clipforge.exe`. Put `ffmpeg.exe` and `ffprobe.exe` next to it. Windows SmartScreen or
-antivirus may flag unsigned PyInstaller apps; that's a known false-positive pattern. An `.exe` isn't
-"protected": PyInstaller output can be unpacked, and the original `.py` is plain readable source anyway.
 
 ## Troubleshooting
 
