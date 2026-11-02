@@ -2,7 +2,7 @@
 
 A simple program that can quickly export multiple videos at once with a wide variety of configurations.
 
-One Python file, completely open source and free to use. Uses [FFmpeg](https://ffmpeg.org) for all the heavy lifting.
+Completely **open source** and free to use. Uses [FFmpeg](https://ffmpeg.org) for all the heavy lifting.
 
 <img width="1013" height="783" alt="image" src="https://github.com/user-attachments/assets/8fc7ec11-12f7-4027-b6d8-4542aec77579" />
 
