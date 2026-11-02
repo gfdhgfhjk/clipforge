@@ -54,7 +54,7 @@ One Python file, completely open source and free to use. Uses [FFmpeg](https://f
 2. **Get FFmpeg** (a *full* build with GPU encoders): download `ffmpeg-release-essentials.zip` from
    <https://www.gyan.dev/ffmpeg/builds/>, open it, go into `bin`, create a new folder, and copy **`ffmpeg.exe`** and **`ffprobe.exe`**
    into the same folder as `clipforge.py`. (Or install with `winget install Gyan.FFmpeg` and restart your terminal.)
-3. Open PowerShell in that folder using "cd (put the path to the file here)" and run:
+3. Open PowerShell in that folder using `cd (put the path to the file here)` and run:
    ```
    python clipforge.py
    ```
