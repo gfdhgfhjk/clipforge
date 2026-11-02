@@ -126,6 +126,5 @@ Every FFmpeg command ClipForge runs is printed in the **Log** tab, handy for rep
 
 ## Notes
 
-- Provided as-is, with no warranty. Test an export on a few clips before a big batch.
-- This project was written with AI assistance (Claude, by Anthropic). No copyright is claimed on it.
+- This project was written with AI assistance (Claude, by Anthropic).
 - FFmpeg, NVENC, AMF, QSV, YouTube and other names belong to their respective owners; this project is not affiliated with them.
