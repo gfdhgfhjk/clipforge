@@ -12,12 +12,14 @@ NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def find(n):
-    p = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), n + (".exe" if os.name == "nt" else ""))
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(base, n + (".exe" if os.name == "nt" else ""))
     return p if os.path.exists(p) else shutil.which(n)
 
 
 FF, FP = find("ffmpeg"), find("ffprobe")
 HEAD = [FF, "-y", "-hide_banner", "-nostdin", "-loglevel", "warning", "-progress", "pipe:1", "-nostats"]
+BATCH = 8  # max clips open in one FFmpeg process (each open clip = its own decoder + buffers)
 COPY = "⚡ Stream copy (instant - identical clips only)"
 ENCODERS = [("h264_nvenc", "NVIDIA NVENC H.264"), ("hevc_nvenc", "NVIDIA NVENC HEVC"), ("av1_nvenc", "NVIDIA NVENC AV1"),
             ("h264_amf", "AMD AMF H.264"), ("hevc_amf", "AMD AMF HEVC"), ("av1_amf", "AMD AMF AV1"),
@@ -48,7 +50,7 @@ def detect(logf=print):
 
 def probe(path):
     r = run([FP, "-v", "error", "-show_entries",
-             "stream=codec_type,codec_name,width,height,r_frame_rate,pix_fmt,sample_rate,channels:stream_side_data=rotation:format=duration:format_tags=creation_time",
+             "stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,pix_fmt,sample_rate,channels:stream_side_data=rotation:format=duration:format_tags=creation_time",
              "-of", "json", path])
     d = json.loads(r.stdout)
     v = next((s for s in d.get("streams", []) if s["codec_type"] == "video"), None)
@@ -58,6 +60,8 @@ def probe(path):
         raise ValueError("no video stream")
     n, m = map(int, v["r_frame_rate"].split("/"))
     fps = n / m if m else 30.0
+    an, am = map(int, v.get("avg_frame_rate", "0/1").split("/"))
+    vfr = bool(am) and abs(an / am - fps) > 0.5
     w, h = v["width"], v["height"]
     rot = next((abs(int(float(x["rotation"]))) for x in v.get("side_data_list", []) if "rotation" in x), 0)
     if rot in (90, 270):
@@ -73,7 +77,7 @@ def probe(path):
     except Exception:
         pass
     return dict(path=path, name=os.path.basename(path), dur=float(d["format"]["duration"]), w=w, h=h, fps=fps,
-                sig=sig + (na,), audio=bool(a), na=na, ctime=ct, mtime=stt.st_mtime, meta=meta, ss=0.0, to=None)
+                sig=sig + (na,), audio=bool(a), na=na, vfr=vfr, ctime=ct, mtime=stt.st_mtime, meta=meta, ss=0.0, to=None)
 
 
 def ptime(s):
@@ -99,7 +103,7 @@ def rec_mbps(H, fps, enc):
     return b * (0.7 if ("265" in enc or "hevc" in enc or "av1" in enc or "svt" in enc) else 1)
 
 
-def vopts(enc, q, speed, fps, H, cap, yt):
+def vopts(enc, q, speed, fps, H, cap, yt, tag=True):
     """Video encoder options. speed: 0 fast, 1 balanced, 2 best quality. q: x264-style quality (lower=better)."""
     off = {"libsvtav1": 9, "libx265": 3}.get(enc, 7 if "av1" in enc else 2 if "hevc" in enc else 0)
     Q = int(q) + off
@@ -109,7 +113,8 @@ def vopts(enc, q, speed, fps, H, cap, yt):
     a = ["-c:v", enc]
     if "nvenc" in enc:
         a += ["-preset", ["p3", "p5", "p7"][speed], "-tune", "hq", "-rc", "vbr", "-cq", str(Q), "-b:v", "0"] + capa
-        a += [aq("spatial"), "1", aq("temporal"), "1", "-rc-lookahead", "24"]
+        if speed:  # Balanced / Best quality only; "Fastest" skips lookahead + AQ
+            a += [aq("spatial"), "1", aq("temporal"), "1", "-rc-lookahead", "24"]
     elif "amf" in enc:
         a += ["-quality", ["speed", "balanced", "quality"][speed]]
         a += (["-rc", "vbr_peak", "-b:v", f"{rb:.1f}M", "-maxrate", mr] if cap
@@ -126,7 +131,7 @@ def vopts(enc, q, speed, fps, H, cap, yt):
         a += ["-profile:v", "high"]
         if "nvenc" in enc or enc == "libx264":
             a += ["-bf", "2"]
-    if "265" in enc or enc.startswith("hevc"):
+    if tag and ("265" in enc or enc.startswith("hevc")):
         a += ["-tag:v", "hvc1"]
     a += ["-pix_fmt", "yuv420p", "-g", str(max(1, round(fps / 2)) if yt else fps * 2)]
     if yt:  # YouTube recommended: closed GOP, keyframe every 0.5s, BT.709
@@ -134,9 +139,23 @@ def vopts(enc, q, speed, fps, H, cap, yt):
     return a
 
 
-def vchain(W, H, fps, ovf=""):
-    return (f"fps={fps},scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos:out_color_matrix=bt709,"
-            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1," + (ovf + "," if ovf else "") + "format=yuv420p")
+def vchain(W, H, fps, ovf="", c=None, hq=False):
+    """Per-clip video filter chain. With clip info `c`, skips fps/scale/pad when the clip already matches
+    (running them anyway costs 2-3x the filter time). hq=True uses lanczos scaling, otherwise faster bicubic."""
+    f, alg = [], "lanczos" if hq else "bicubic"
+    if not c or c.get("vfr") or abs(c["fps"] - fps) > 0.01:
+        f.append(f"fps={fps}")
+    if not c or (c["w"], c["h"]) != (W, H):
+        if c and abs(c["w"] / c["h"] - W / H) < 0.003:
+            f.append(f"scale={W}:{H}:flags={alg}:out_color_matrix=bt709")
+        else:
+            f.append(f"scale={W}:{H}:force_original_aspect_ratio=decrease:flags={alg}:out_color_matrix=bt709")
+            f.append(f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2")
+    f.append("setsar=1")
+    if ovf:
+        f.append(ovf)
+    f.append("format=yuv420p")
+    return ",".join(f)
 
 
 def mixparts(i, n, v1, v2, out):
@@ -244,7 +263,7 @@ class App(tk.Tk):
         self.geometry("1020x760")
         ttk.Style(self).theme_use("clam")
         self.clips, self.q, self.proc, self.avail, self.busy, self.fastest = [], queue.Queue(), None, [], False, None
-        self.tail = deque(maxlen=8)
+        self.tail = deque(maxlen=8); self.stop = False
         self.emap = {COPY: "copy"}
         self.fonts, self.ov_ok, self.ov_color = find_fonts(), True, "#ffffff"
         self.build_ui()
@@ -281,7 +300,7 @@ class App(tk.Tk):
         self.enc = tk.StringVar(); self.res = tk.StringVar(value="1080p"); self.fps = tk.StringVar(value="Auto (max of clips, cap 60)")
         self.speed = ttk.Combobox(f, state="readonly", width=22, values=["Fastest", "Balanced", "Best quality"]); self.speed.current(1)
         self.ab = tk.StringVar(value="192k"); self.qv = tk.DoubleVar(value=21)
-        self.yt, self.cap, self.hw = tk.BooleanVar(value=True), tk.BooleanVar(value=True), tk.BooleanVar(value=True)
+        self.yt, self.cap, self.hw = tk.BooleanVar(value=True), tk.BooleanVar(value=True), tk.BooleanVar(value=False)
         self.encbox = ttk.Combobox(f, textvariable=self.enc, state="readonly", width=44)
         rows = [("Encoder", self.encbox), ("Resolution", ttk.Combobox(f, textvariable=self.res, state="readonly", width=26,
                 values=["Auto (largest clip)", "720p", "1080p", "1440p (YouTube VP9 boost)", "2160p (4K)"])),
@@ -299,7 +318,7 @@ class App(tk.Tk):
         self.ql.pack(side="left")
         for i, (t, v) in enumerate([("YouTube-optimised (closed GOP, 0.5s keyframes, BT.709, faststart)", self.yt),
                                     ("Cap bitrate at YouTube-recommended level (saves storage)", self.cap),
-                                    ("Hardware decoding (auto-off above 24 mixed clips)", self.hw)]):
+                                    ("Hardware decoding (off = safest; on can be faster on some PCs)", self.hw)]):
             ttk.Checkbutton(f, text=t, variable=v).grid(row=4 + i, column=0, columnspan=4, sticky="w", padx=6)
 
         self.merge, self.v1, self.v2 = tk.BooleanVar(value=True), tk.StringVar(value="100"), tk.StringVar(value="100")
@@ -413,7 +432,7 @@ class App(tk.Tk):
         c = st["clips"][i]; W, H, fps = target(st); tmp = tempfile.mkdtemp()
         try:
             png = os.path.join(tmp, "p.png")
-            vf = vchain(W, H, fps, overlay_filter(st["ov"], c, i, H, tmp)) + ",scale=w=960:h=640:force_original_aspect_ratio=decrease"
+            vf = vchain(W, H, fps, overlay_filter(st["ov"], c, i, H, tmp), c, st["speed"] == 2) + ",scale=w=960:h=640:force_original_aspect_ratio=decrease"
             r = subprocess.run([FF, "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{min(1.0, c['dur'] / 2):.2f}", "-i", c["path"], "-frames:v", "1", "-vf", vf, png],
                                capture_output=True, text=True, errors="replace", cwd=tmp, creationflags=NOWIN)
             if r.returncode:
@@ -550,17 +569,19 @@ class App(tk.Tk):
         m = re.search(r"version n?(\d+)", run([FF, "-version"]).stdout)
         return ["-/filter_complex" if (not m or int(m[1]) >= 7) else "-filter_complex_script", p]
 
-    def build(self, st, out, hw, tmp):
+    def build(self, st, out, hw, tmp, tgt=None, off=0, seg=False):
         cl, enc, ov = st["clips"], st["enc"], st["ov"]
-        W, H, fps = target(st)
+        W, H, fps = tgt or target(st)
+        hq = st["speed"] == 2
         multi = st["merge"] and any(c["na"] >= 2 for c in cl)
         same = len({c["sig"] for c in cl}) == 1 and not any(c["ss"] or c["to"] for c in cl)
         if ov["on"] and not self.ov_ok:
             raise RuntimeError("This FFmpeg build has no 'drawtext' filter. Install a full build (gyan.dev) or turn the overlay off.")
         if enc == "copy" and not (same and not multi and not ov["on"]):
             raise RuntimeError("Stream copy needs identical clips, no trims, no overlay and no audio merging. Pick an encoder instead.")
-        aud = ["-c:a", "aac", "-b:a", st["ab"], "-ar", "48000", "-ac", "2", "-movflags", "+faststart"]
-        v = vopts(enc, st["q"], st["speed"], fps, H, st["cap"], st["yt"]) if enc != "copy" else []
+        aud = (["-c:a", "flac", "-ar", "48000", "-ac", "2"] if seg else
+               ["-c:a", "aac", "-b:a", st["ab"], "-ar", "48000", "-ac", "2", "-movflags", "+faststart"])
+        v = vopts(enc, st["q"], st["speed"], fps, H, st["cap"], st["yt"], not seg) if enc != "copy" else []
         cmd = list(HEAD)
         if same and not ov["on"]:  # concat demuxer: one decoder, constant memory, fastest path
             lst = os.path.join(tmp, "list.txt")
@@ -569,15 +590,15 @@ class App(tk.Tk):
             if enc == "copy":
                 return cmd + ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart", out]
             if multi:
-                fg = f"[0:v]{vchain(W, H, fps)}[v];" + mixparts(0, cl[0]["na"], st["v1"], st["v2"], "a")
+                fg = f"[0:v]{vchain(W, H, fps, '', cl[0], hq)}[v];" + mixparts(0, cl[0]["na"], st["v1"], st["v2"], "a")
                 return cmd + self.fgargs(fg, tmp) + ["-map", "[v]", "-map", "[a]"] + v + aud + [out]
-            return cmd + ["-vf", vchain(W, H, fps), "-map", "0:v:0", "-map", "0:a:0?"] + v + aud + [out]
+            return cmd + ["-vf", vchain(W, H, fps, "", cl[0], hq), "-map", "0:v:0", "-map", "0:a:0?"] + v + aud + [out]
         parts, cat = [], ""
         for i, c in enumerate(cl):
             d = (c["to"] or c["dur"]) - c["ss"]
-            ovf = overlay_filter(ov, c, i, H, tmp) if ov["on"] else ""
+            ovf = overlay_filter(ov, c, i + off, H, tmp) if ov["on"] else ""
             cmd += (["-hwaccel", "auto"] if hw else []) + (["-ss", f"{c['ss']:.3f}"] if c["ss"] else []) + (["-to", f"{c['to']:.3f}"] if c["to"] else []) + ["-i", c["path"]]
-            parts.append(f"[{i}:v]{vchain(W, H, fps, ovf)}[v{i}]")
+            parts.append(f"[{i}:v]{vchain(W, H, fps, ovf, c, hq)}[v{i}]")
             if c["audio"] and st["merge"] and c["na"] >= 2:
                 parts.append(mixparts(i, c["na"], st["v1"], st["v2"], f"a{i}"))
             elif c["audio"]:
@@ -588,8 +609,8 @@ class App(tk.Tk):
         fg = ";".join(parts + [f"{cat}concat=n={len(cl)}:v=1:a=1[v][a]"])
         return cmd + self.fgargs(fg, tmp) + ["-map", "[v]", "-map", "[a]"] + v + aud + [out]
 
-    def runff(self, cmd, total, show=True, cwd=None):
-        self.proc = p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", creationflags=NOWIN, cwd=cwd)
+    def runff(self, cmd, total, show=True, cwd=None, base=0.0, grand=None, t0g=None, label=""):
+        self.proc = p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", creationflags=NOWIN | (0x4000 if os.name == "nt" else 0), cwd=cwd)  # 0x4000 = below-normal priority
         t = fr = size = 0
         t0 = time.perf_counter()
         for line in p.stdout:
@@ -605,43 +626,101 @@ class App(tk.Tk):
             elif k == "total_size" and v.isdigit():
                 size = int(v)
             elif k == "progress" and show and t > 0:
-                el = time.perf_counter() - t0
-                sp = t / el if el else 0
-                eta = (total - t) / sp if sp else 0
-                est = size / t * total / 1e6 if t else 0
-                s = f"{t / total:.0%}  |  {sp:.1f}x realtime  |  {fr / el:.0f} fps  |  ETA {fmt(eta)}  |  est. size {est:.0f} MB"
-                self.q.put(lambda s=s, pr=min(1, t / total): self.upd(pr, s))
+                now = time.perf_counter(); el = now - t0; gt = grand or total; done = base + t
+                sp = done / (now - (t0g or t0)) if now > (t0g or t0) else 0
+                s = f"{label}{min(1, done / gt):.0%}  |  {sp:.1f}x realtime  |  {fr / max(el, 1e-6):.0f} fps  |  ETA {fmt((gt - done) / sp if sp else 0)}"
+                if not grand:
+                    s += f"  |  est. size {size / t * total / 1e6:.0f} MB"
+                self.q.put(lambda s=s, pr=min(1, done / gt): self.upd(pr, s))
         rc = p.wait()
         return rc, t, fr, time.perf_counter() - t0, size
 
+    def try_batch(self, st, idx, seg, tmp, tgt, base, tot, t0, label):
+        sub = dict(st, clips=[st["clips"][i] for i in idx])
+        bd = sum((c["to"] or c["dur"]) - c["ss"] for c in sub["clips"])
+        for hw in ([True, False] if st["hw"] else [False]):
+            cmd = self.build(sub, seg, hw, tmp, tgt, idx[0], True)
+            self.log("$ " + subprocess.list2cmdline(cmd))
+            rc = self.runff(cmd, bd, cwd=tmp, base=base, grand=tot, t0g=t0, label=label)[0]
+            if rc == 0 or self.stop:
+                break
+            self.log("Batch failed" + (" - retrying without hardware decoding" if hw else ""))
+        return rc == 0 and not self.stop
+
+    def export_segmented(self, st, out, tmp, tot):
+        """Big exports: encode small batches one at a time (flat memory use), then join them with no re-encode."""
+        cl, enc = st["clips"], st["enc"]
+        tgt = target(st); W, H, fps = tgt
+        need = (2 * rec_mbps(H, fps, enc) / 8 + 0.12) * tot * 1.25  # MB: segments + final file + lossless audio
+        free = shutil.disk_usage(tmp).free / 1e6
+        if free < need:
+            raise RuntimeError(f"Not enough free disk space next to the output file: need about {need / 1000:.1f} GB, have {free / 1000:.1f} GB.")
+        batches = [list(range(i, min(i + BATCH, len(cl)))) for i in range(0, len(cl), BATCH)]
+        segs, skipped, base, t0 = [], [], 0.0, time.perf_counter()
+        for bi, idx in enumerate(batches):
+            lab = f"Batch {bi + 1}/{len(batches)}  |  "
+            seg = os.path.join(tmp, f"seg{len(segs):05d}.mkv")
+            if self.try_batch(st, idx, seg, tmp, tgt, base, tot, t0, lab):
+                segs.append(seg)
+            elif not self.stop:
+                for i in idx:  # isolate a bad clip instead of failing the whole export
+                    s1 = os.path.join(tmp, f"seg{len(segs):05d}.mkv")
+                    if len(idx) > 1 and self.try_batch(st, [i], s1, tmp, tgt, base, tot, t0, lab):
+                        segs.append(s1)
+                    else:
+                        skipped.append(cl[i]["name"]); self.log(f"SKIPPED unreadable clip: {cl[i]['name']}")
+            if self.stop:
+                return 1, 0, skipped
+            base += sum((cl[i]["to"] or cl[i]["dur"]) - cl[i]["ss"] for i in idx)
+        if not segs:
+            return 1, 0, skipped
+        lst = os.path.join(tmp, "join.txt")
+        open(lst, "w", encoding="utf-8").write("\n".join(qpath(p) for p in segs))
+        cmd = HEAD + ["-f", "concat", "-safe", "0", "-i", lst, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", st["ab"],
+                      "-ar", "48000", "-ac", "2"] + (["-tag:v", "hvc1"] if ("265" in enc or enc.startswith("hevc")) else []) + ["-movflags", "+faststart", out]
+        self.log("$ " + subprocess.list2cmdline(cmd))
+        self.q.put(lambda: self.status.set("Joining batches..."))
+        rc = self.runff(cmd, tot, cwd=tmp, label="Joining  |  ")[0]
+        return rc, time.perf_counter() - t0, skipped
+
     def do_export(self, st, out):
-        tmp = tempfile.mkdtemp()
+        tmp = None
         try:
             out = os.path.abspath(out)
             os.makedirs(os.path.dirname(out), exist_ok=True)
-            cl = st["clips"]
+            cl, enc = st["clips"], st["enc"]
             tot = sum((c["to"] or c["dur"]) - c["ss"] for c in cl)
-            same = len({c["sig"] for c in cl}) == 1 and not st["ov"]["on"]
-            hws = [True, False] if (st["hw"] and st["enc"] != "copy" and (same or len(cl) <= 24)) else [False]
-            for hw in hws:
-                cmd = self.build(st, out, hw, tmp)
-                self.log("$ " + subprocess.list2cmdline(cmd))
-                rc, t, fr, el, _ = self.runff(cmd, tot, cwd=tmp)
-                if rc == 0 or self.proc is None:
-                    break
-                self.log("Encode failed" + (" - retrying without hardware decoding" if hw else ""))
+            sig1 = len({c["sig"] for c in cl}) == 1
+            demux = sig1 and not st["ov"]["on"] and not any(c["ss"] or c["to"] for c in cl)
+            seg = enc != "copy" and not demux and len(cl) > BATCH
+            tmp = tempfile.mkdtemp(prefix=".clipforge_", dir=os.path.dirname(out) if seg else None)
+            self.stop, skipped = False, []
+            if seg:
+                rc, el, skipped = self.export_segmented(st, out, tmp, tot)
+            else:
+                hws = [True, False] if (st["hw"] and enc != "copy" and (demux or len(cl) <= BATCH)) else [False]
+                for hw in hws:
+                    cmd = self.build(st, out, hw, tmp)
+                    self.log("$ " + subprocess.list2cmdline(cmd))
+                    rc, t, fr, el, _ = self.runff(cmd, tot, cwd=tmp)
+                    if rc == 0 or self.proc is None:
+                        break
+                    self.log("Encode failed" + (" - retrying without hardware decoding" if hw else ""))
             if rc == 0:
                 mb = os.path.getsize(out) / 1e6
                 msg = f"Done in {fmt(el)} ({tot / el:.1f}x realtime) - {mb:.0f} MB ({mb / (tot / 60):.0f} MB/min)"
+                if skipped:
+                    msg += f"\n\nSKIPPED {len(skipped)} unreadable clip(s):\n" + "\n".join(skipped[:10])
                 self.q.put(lambda: self.finished(msg, out))
             else:
-                err = "\n".join(list(self.tail)[-4:])
+                err = "Cancelled" if self.stop else "\n".join(list(self.tail)[-4:])
                 self.q.put(lambda: (self.set_busy(False), self.status.set("Export failed/cancelled"), messagebox.showerror("Export failed", err or "Cancelled")))
         except Exception as e:
             self.q.put(lambda e=e: (self.set_busy(False), messagebox.showerror("Error", str(e))))
         finally:
             self.proc = None
-            shutil.rmtree(tmp, ignore_errors=True)
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
 
     def finished(self, msg, out):
         self.set_busy(False); self.status.set(msg)
@@ -651,6 +730,7 @@ class App(tk.Tk):
             os.startfile(os.path.dirname(os.path.abspath(out)))
 
     def cancel(self):
+        self.stop = True
         if self.proc:
             p, self.proc = self.proc, None
             p.terminate()
