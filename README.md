@@ -75,13 +75,10 @@ macOS / Linux: install FFmpeg with `brew install ffmpeg` / `sudo apt install ffm
 5. Check the output path (defaults to your **Downloads** folder with a timestamped name), then **▶ EXPORT**.
 6. Upload the resulting `.mp4` to YouTube.
 
-**Saving storage:** try HEVC or AV1 if your GPU supports them (RTX 40-series, RX 7000, Arc). Use the
+**Saving storage:** Use HEVC or AV1 if your GPU supports them (RTX 40-series, RX 7000, Arc). Use the
 **Speed tester** tab to compare encoders; look at SSIM per MB. The same quality-slider number is not exactly
 the same visual quality on different encoders.
 
-## Is the export as fast as possible?
-
-It's well optimised, but there's no honest way to call it "maximum". What it does:
 
 - Encoding runs on the GPU. The remaining cost is **CPU-side decode/filtering and disk speed**.
 - It skips filters a clip doesn't need, uses fast bicubic scaling unless you choose *Best quality*, and
@@ -97,8 +94,7 @@ parallel. Both can be faster on some hardware but add complexity and fragility.
 
 ## FFmpeg is not included
 
-ClipForge only *runs* FFmpeg; it doesn't contain it. FFmpeg has its own license (LGPL/GPL depending on the
-build), so download it yourself from the links above rather than expecting it in this repo or release.
+You must download FFmpeg yourself from the links above in order to use ClipForge.
 
 ## Making a double-click `.exe` (optional)
 
@@ -117,7 +113,7 @@ antivirus may flag unsigned PyInstaller apps; that's a known false-positive patt
 
 | Problem | Fix |
 |---|---|
-| "ffmpeg/ffprobe not found" | Put both `.exe` files next to `clipforge.py`, or add FFmpeg to PATH |
+| "ffmpeg/ffprobe not found" | Follow the instructions above to download FFmpeg and put both `.exe` files next to `clipforge.py`, or add FFmpeg to PATH |
 | GPU encoder not listed | Update your GPU driver (NVIDIA / AMD Adrenalin). Check the **Log** tab, which says why each encoder was rejected |
 | AV1 encoders missing | Needs RTX 40-series, RX 7000-series or Intel Arc, plus a recent FFmpeg |
 | Overlay unavailable | Your FFmpeg build lacks the `drawtext` filter. Use a full build from gyan.dev |
