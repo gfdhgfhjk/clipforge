@@ -1,8 +1,8 @@
 # ClipForge
 
-A simple program that can quickly export multiple videos at once with a wide variety of configurations
+A simple program that can quickly export multiple videos at once with a wide variety of configurations.
 
-One Python file. Uses [FFmpeg](https://ffmpeg.org) for all the heavy lifting.
+One Python file, completely open source and free to use. Uses [FFmpeg](https://ffmpeg.org) for all the heavy lifting.
 
 ---
 
